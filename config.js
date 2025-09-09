@@ -1,31 +1,21 @@
-// config.js
-import 'dotenv/config';
+// config.js — shared config with Drako fallbacks
 
-function req(key) {
-  const v = process.env[key];
-  if (!v) throw new Error(`Missing required env: ${key}`);
-  return v;
+function pick(...keys) {
+  for (const k of keys) {
+    const v = process.env[k];
+    if (v && `${v}`.trim() !== '') return v.trim();
+  }
+  return undefined;
 }
 
-const cfg = {
-  token: req('DISCORD_TOKEN'),
+export default {
+  // Token / ids
+  token:                  pick('DRAKO_DISCORD_TOKEN', 'DISCORD_TOKEN'),
+  applicationId:          pick('DRAKO_APPLICATION_ID', 'APPLICATION_ID'),
+  guildId:                pick('DRAKO_GUILD_ID', 'GUILD_ID'),
+  ownerId:                pick('DRAKO_OWNER_ID', 'OWNER_ID'),
 
-  // Application / bot IDs
-  appId: req('APPLICATION_ID'),
-  clientId: req('APPLICATION_ID'),   // <-- add alias so register-commands works
-  guildId: req('GUILD_ID'),
-
-  // Channels
-  signalsChannelId: req('SIGNALS_CHANNEL_ID'),
-  currentTradesChannelId: req('CURRENT_TRADES_CHANNEL_ID'),
-
-  // Owner
-  ownerId: req('OWNER_ID'),
-
-  // Optional branding
-  brandName: process.env.BRAND_NAME || 'JV Trades',
-  brandAvatarUrl: process.env.BRAND_AVATAR_URL || null,
-  mentionRoleId: process.env.TRADER_ROLE_ID || process.env.MENTION_ROLE_ID || null,
+  // Roles / channels
+  traderRoleId:           pick('DRAKO_TRADER_ROLE_ID', 'TRADER_ROLE_ID'),
+  currentTradesChannelId: pick('DRAKO_CURRENT_TRADES_CHANNEL_ID', 'CURRENT_TRADES_CHANNEL_ID'),
 };
-
-export default cfg;
