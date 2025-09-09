@@ -239,7 +239,7 @@ async function updateSummary() {
       }
 
       const content = active.length === 0
-        ? `**JV Current Active Trades** 📊\n\n• There are currently no ongoing trades valid for entry – stay posted for future trades!`
+        ? `**Drako Current Active Trades** 📊\n\n• There are currently no ongoing trades valid for entry – stay posted for future trades!`
         : renderSummaryText(active);
 
       // Try to edit an existing bot message first
