@@ -1,14 +1,11 @@
-// index.js — JV Signal Bot + Drako (Sep 2025)
-// - Signals post in the channel where the command is run (per-signal channelId)
-// - Two namespaces:
-//     • "main"  -> /signal  -> summary to config.currentTradesChannelId
-//     • "drako" -> /drako   -> summary to DRAKO_SUMMARY_CHANNEL_ID
-// - Control panel per signal (private thread) visible to: creator + owner
-// - Only owner can use /signal; /drako allowed for owner OR DrakoRole
-// - Manual delete watcher & ghost-prune across any channel
-// - Debounced summary; keeps exactly one message per summary channel
-// - One-time TP hits; TP plan auto-exec; Final R optional override
-// - Safe interaction acks + dedupe to avoid “unknown interaction / already replied” issues
+// index.js — Drako Signal Bot
+// - /drako command
+// - Posts in the channel where command is used
+// - Private control thread (owner + author)
+// - Summary in DRAKO_CURRENT_TRADES_CHANNEL_ID
+// - Role-gated (OWNER_ID or DRAKO_TRADER_ROLE_ID)
+// - Handles manual deletes (excludes missing messages from summary)
+// - Auto-registers the /drako command
 
 import {
   Client,
@@ -20,31 +17,55 @@ import {
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
-  MessageFlags,
+  Partials,
+  EmbedBuilder,
+  Routes,
+  PermissionFlagsBits,
 } from 'discord.js';
+import { REST } from '@discordjs/rest';
 import { customAlphabet } from 'nanoid';
-import config from './config.js';
-import {
+import config from './config.js'; // we still read fallback values here
+
+// --------- ENV / CONFIG (Drako-first, fallback to generic) ----------
+const E = process.env;
+
+// Ensure store.js sees the right DB path (we don't touch store.js)
+if (E.DRAKO_DB_PATH && !E.DB_PATH) E.DB_PATH = E.DRAKO_DB_PATH;
+
+// Dynamic import AFTER setting DB_PATH
+const store = await import('./store.js');
+const {
   saveSignal, getSignal, getSignals, updateSignal, deleteSignal,
   getThreadId, setThreadId
-} from './store.js';
-import { renderSignalText, renderSummaryText } from './embeds.js';
+} = store;
 
-const nano = customAlphabet('1234567890abcdef', 10);
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
-});
+const cfg = {
+  token: E.DRAKO_DISCORD_TOKEN || config.token,
+  applicationId: E.DRAKO_APPLICATION_ID || config.applicationId,
+  guildId: E.DRAKO_GUILD_ID || config.guildId,
+  ownerId: E.DRAKO_OWNER_ID || config.ownerId,
+  mentionRoleId: E.DRAKO_TRADER_ROLE_ID || config.traderRoleId,
+  currentTradesChannelId: E.DRAKO_CURRENT_TRADES_CHANNEL_ID || config.currentTradesChannelId,
+};
 
-// ====== Drako constants (no other files needed) ======
-const DRAKO_ROLE_ID = '1292857853647917178';          // who can use /drako
-const DRAKO_SUMMARY_CHANNEL_ID = '1414759185064919262';// where Drako summary goes
+if (!cfg.token || !cfg.applicationId || !cfg.guildId || !cfg.ownerId || !cfg.currentTradesChannelId) {
+  console.error('❌ Missing required env. Please set the DRAKO_* variables (token, app id, guild id, owner id, summary channel).');
+  process.exit(1);
+}
 
 // ---- global error catcher so bot doesn’t crash ----
 process.on('unhandledRejection', (err) => console.error('unhandledRejection:', err));
 process.on('uncaughtException',  (err) => console.error('uncaughtException:', err));
 
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
+  partials: [Partials.Channel, Partials.Message],
+});
+
+const nano = customAlphabet('1234567890abcdef', 10);
+
 // ------------------------------
-// Utility & core signal helpers
+// Utils & helpers
 // ------------------------------
 const isNum = (v) => v !== undefined && v !== null && v !== '' && !isNaN(Number(v));
 const toNumOrNull = (v) => (isNum(v) ? Number(v) : null);
@@ -98,9 +119,7 @@ function normalizeSignal(raw) {
     const v = s.plan[K];
     s.plan[K] = isNum(v) ? Number(v) : null;
   }
-  // track one-time TP hits
   s.tpHits = s.tpHits && typeof s.tpHits === 'object' ? s.tpHits : { TP1:false, TP2:false, TP3:false, TP4:false, TP5:false };
-  // optional final-R override for closures
   if (s.finalR !== undefined && s.finalR !== null && !isNum(s.finalR)) delete s.finalR;
   return s;
 }
@@ -114,53 +133,73 @@ function extractRoleIds(defaultRoleId, extraRoleRaw) {
   const ids = [];
   if (defaultRoleId) ids.push(defaultRoleId);
   if (!extraRoleRaw) return ids;
-  const found = `${extraRoleRaw}`.match(/\d{6,}/g);
+  const found = extraRoleRaw.match(/\d{6,}/g);
   if (found) ids.push(...found);
   return Array.from(new Set(ids));
 }
 function buildMentions(defaultRoleId, extraRoleRaw, forEdit = false) {
   const ids = extractRoleIds(defaultRoleId, extraRoleRaw);
   const content = ids.length ? ids.map(id => `<@&${id}>`).join(' ') : '';
-  // On initial send we allowRoles to ping; on edits we suppress pings entirely
   if (forEdit) return { content, allowedMentions: { parse: [] } };
   if (!ids.length) return { content: '', allowedMentions: { parse: [] } };
   return { content, allowedMentions: { parse: [], roles: ids } };
 }
 
 // ------------------------------
-// Ack helpers (prevent reply errors)
+// Renders (plain text, matching your embeds.js style)
 // ------------------------------
-async function ensureDeferred(interaction) {
-  try {
-    if (!interaction.deferred && !interaction.replied) {
-      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-    }
-  } catch {}
-}
-async function safeEditReply(interaction, payload) {
-  try {
-    if (!interaction.deferred && !interaction.replied) {
-      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-    }
-  } catch {}
-  try {
-    return await interaction.editReply(payload);
-  } catch (e) {
-    try {
-      if (!interaction.replied) return await interaction.reply({ ...payload, flags: MessageFlags.Ephemeral });
-    } catch {}
-    throw e;
+function renderSignalText(signal, rrChips, slAtBE) {
+  const head = `**${signal.asset} ${signal.direction === 'LONG' ? 'Long' : 'Short'}** ${slAtBE ? '🟢' : '🟢'} — <#${signal.channelId ?? ''}>`;
+  const e = isNum(signal.entry) ? signal.entry : '—';
+  const s = isNum(signal.sl) ? signal.sl : '—';
+  const lines = [
+    head,
+    `Entry: ${e}`,
+    `SL: ${s}`,
+  ];
+  const tps = TP_KEYS
+    .map(k => [k.toUpperCase(), signal[k]])
+    .filter(([,v]) => isNum(v))
+    .map(([K, v]) => `${K}: ${v}`);
+  if (tps.length) lines.push(tps.join(' | '));
+
+  if (signal.reason && signal.reason.trim()) lines.push(`Reason: ${signal.reason.trim()}`);
+
+  if (rrChips.length) {
+    const chips = rrChips.map(c => `${c.key} ${c.r}R`).join(' • ');
+    lines.push(`R/R: ${chips}`);
   }
+  if (signal.jumpUrl) lines.push(`[Jump](${signal.jumpUrl})`);
+
+  return lines.join('\n');
+}
+
+function renderSummaryText(active) {
+  const header = `**Drako Current Active Trades** 📊`;
+  if (!active.length) {
+    return `${header}\n\n• There are currently no ongoing trades valid for entry – stay posted for future trades!`;
+  }
+  const lines = [header, ''];
+  active.forEach((s, i) => {
+    const e = isNum(s.entry) ? s.entry : '—';
+    const sl = isNum(s.sl) ? s.sl : '—';
+    const chan = s.channelId ? `<#${s.channelId}>` : '—';
+    lines.push(`${i+1}. ${s.asset} ${s.direction === 'LONG' ? 'Long' : 'Short'} 🟢 — ${chan}`);
+    lines.push(`   Entry: ${e}`);
+    lines.push(`   SL: ${sl}`);
+    lines.push('');
+  });
+  return lines.join('\n');
 }
 
 // ------------------------------
-// Posting / Editing messages (per-signal channelId)
+// Posting / Editing messages (in the current channel)
 // ------------------------------
 async function postSignalMessage(signal) {
   const channel = await client.channels.fetch(signal.channelId);
   const rrChips = computeRRChips(signal);
   const text = renderSignalText(normalizeSignal(signal), rrChips, isSlMovedToBE(signal));
-  const { content: mentionLine, allowedMentions } = buildMentions(config.mentionRoleId, signal.extraRole, false);
+  const { content: mentionLine, allowedMentions } = buildMentions(cfg.mentionRoleId, signal.extraRole, false);
 
   const sent = await channel.send({
     content: `${text}${mentionLine ? `\n\n${mentionLine}` : ''}`,
@@ -175,7 +214,7 @@ async function editSignalMessage(signal) {
   if (!msg) return false;
   const rrChips = computeRRChips(signal);
   const text = renderSignalText(normalizeSignal(signal), rrChips, isSlMovedToBE(signal));
-  const { content: mentionLine, allowedMentions } = buildMentions(config.mentionRoleId, signal.extraRole, true);
+  const { content: mentionLine, allowedMentions } = buildMentions(cfg.mentionRoleId, signal.extraRole, true);
 
   await msg.edit({
     content: `${text}${mentionLine ? `\n\n${mentionLine}` : ''}`,
@@ -191,11 +230,8 @@ async function deleteSignalMessage(signal) {
 }
 
 // ------------------------------
-// Summary (per-namespace; debounced, single message)
+// Summary helpers
 // ------------------------------
-let _summaryTimer = null;
-let _summaryBusy = false;
-
 async function hardPurgeChannel(channelId) {
   try {
     const channel = await client.channels.fetch(channelId);
@@ -203,130 +239,97 @@ async function hardPurgeChannel(channelId) {
       const batch = await channel.messages.fetch({ limit: 100 }).catch(() => null);
       if (!batch || batch.size === 0) break;
 
-      const young = batch.filter(m => (Date.now() - m.createdTimestamp) < 14 * 24 * 60 * 60 * 1000);
-      if (young.size) {
-        try { await channel.bulkDelete(young, true); } catch (e) { console.error('purge bulkDelete:', e); }
+      const young = batch.filter(m => (Date.now() - m.createdTimestamp) < 13 * 24 * 60 * 60 * 1000);
+      if (young.size > 1) {
+        try { await channel.bulkDelete(young, true); } catch {}
       }
       const oldies = batch.filter(m => !young.has(m.id));
-      for (const m of oldies.values()) {
-        try { await m.delete(); } catch (e) { console.error('purge single delete:', e); }
-      }
+      for (const m of oldies.values()) { try { await m.delete(); } catch {} }
       if (batch.size < 100) break;
     }
   } catch (e) {
-    console.error('hardPurgeChannel outer error:', e);
+    console.error('hardPurgeChannel error:', e);
   }
 }
 
-async function updateSummaryFor(namespace, channelId, zeroHeader) {
-  const summaryChannel = await client.channels.fetch(channelId);
-
-  const all = (await getSignals()).map(normalizeSignal);
-  const candidates = all.filter(s =>
-    s.namespace === namespace &&
-    s.status === STATUS.RUN_VALID &&
-    s.validReentry === true
-  );
-
-  // keep only signals whose original message still exists
-  const active = [];
-  for (const s of candidates) {
-    let ok = false;
-    if (s.messageId && s.channelId) {
-      try {
-        const ch = await client.channels.fetch(s.channelId);
-        await ch.messages.fetch(s.messageId);
-        ok = true;
-      } catch {}
-    }
-    if (ok) active.push(s);
-  }
-
-  const content = active.length === 0
-    ? `**${zeroHeader}**\n\n• There are currently no ongoing trades valid for entry – stay posted for future trades!`
-    : renderSummaryText(active);
-
-  const recent = await summaryChannel.messages.fetch({ limit: 10 }).catch(() => null);
-  let existing = null;
-  if (recent && recent.size) {
-    existing = Array.from(recent.values()).find(m => m.author?.id === client.user.id && !m.system);
-  }
-
-  if (existing) {
-    await existing.edit({ content, allowedMentions: { parse: [] } }).catch(() => {});
-    for (const m of recent.values()) {
-      if (m.id !== existing.id && m.author?.id === client.user.id) {
-        try { await m.delete(); } catch {}
-      }
-    }
-  } else {
-    await hardPurgeChannel(channelId);
-    await summaryChannel.send({ content, allowedMentions: { parse: [] } }).catch(e => console.error('summary send failed:', e));
-  }
+async function messageExists(channelId, messageId) {
+  try {
+    const ch = await client.channels.fetch(channelId);
+    const m = await ch.messages.fetch(messageId);
+    return !!m;
+  } catch { return false; }
 }
 
 async function updateSummary() {
-  if (_summaryTimer) clearTimeout(_summaryTimer);
-  _summaryTimer = setTimeout(async () => {
-    if (_summaryBusy) return;
-    _summaryBusy = true;
-    try {
-      await updateSummaryFor('main',  config.currentTradesChannelId, 'JV Current Active Trades 📊');
-      await updateSummaryFor('drako', DRAKO_SUMMARY_CHANNEL_ID,     'Drako Current Active Trades 📊');
-    } catch (e) {
-      console.error('updateSummary error:', e);
-    } finally {
-      _summaryBusy = false;
+  try {
+    await hardPurgeChannel(cfg.currentTradesChannelId);
+    const channel = await client.channels.fetch(cfg.currentTradesChannelId);
+    const all = (await getSignals()).map(normalizeSignal);
+
+    // Filter active AND whose original message still exists
+    const filtered = [];
+    for (const s of all) {
+      if (s.status !== STATUS.RUN_VALID || s.validReentry !== true) continue;
+      if (!s.channelId || !s.messageId) continue;
+      const stillThere = await messageExists(s.channelId, s.messageId);
+      if (stillThere) filtered.push(s);
     }
-  }, 600);
+
+    const text = renderSummaryText(filtered);
+    await channel.send({ content: text, allowedMentions: { parse: [] } }).catch(e => console.error('summary send failed:', e));
+  } catch (e) {
+    console.error('updateSummary error:', e);
+  }
 }
 
 // ------------------------------
-// Control UI (TPs + updates + closes)
+// Control UI
 // ------------------------------
-function btn(id, key) { return `btn:${key}:${id}`; }
-function modal(id, key) { return `modal:${key}:${id}`; }
-
 function controlRows(signalId) {
   const row1 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(btn(signalId,'tp1')).setLabel('🎯 TP1 Hit').setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId(btn(signalId,'tp2')).setLabel('🎯 TP2 Hit').setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId(btn(signalId,'tp3')).setLabel('🎯 TP3 Hit').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`tp1_${signalId}`).setLabel('🎯 TP1 Hit').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`tp2_${signalId}`).setLabel('🎯 TP2 Hit').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`tp3_${signalId}`).setLabel('🎯 TP3 Hit').setStyle(ButtonStyle.Success)
   );
   const row2 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(btn(signalId,'tp4')).setLabel('🎯 TP4 Hit').setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId(btn(signalId,'tp5')).setLabel('🎯 TP5 Hit').setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId(btn(signalId,'upd:tpprices')).setLabel('✏️ Update TP Prices').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(btn(signalId,'upd:plan')).setLabel('✏️ Update TP % Plan').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`tp4_${signalId}`).setLabel('🎯 TP4 Hit').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`tp5_${signalId}`).setLabel('🎯 TP5 Hit').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`upd_tpprices_${signalId}`).setLabel('✏️ Update TP Prices').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`upd_plan_${signalId}`).setLabel('✏️ Update TP % Plan').setStyle(ButtonStyle.Secondary),
   );
   const row3 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(btn(signalId,'upd:trade')).setLabel('✏️ Update Trade Info').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(btn(signalId,'upd:roles')).setLabel('✏️ Update Role Mention').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(btn(signalId,'fullclose')).setLabel('✅ Fully Close').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId(btn(signalId,'stopbe')).setLabel('🟥 Stopped BE').setStyle(ButtonStyle.Danger),
-    new ButtonBuilder().setCustomId(btn(signalId,'stopped')).setLabel('🔴 Stopped Out').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(`upd_trade_${signalId}`).setLabel('✏️ Update Trade Info').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`upd_roles_${signalId}`).setLabel('✏️ Update Role Mention').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`fullclose_${signalId}`).setLabel('✅ Fully Close').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`stopbe_${signalId}`).setLabel('🟥 Stopped BE').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(`stopped_${signalId}`).setLabel('🔴 Stopped Out').setStyle(ButtonStyle.Danger),
   );
   const row4 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(btn(signalId,'del')).setLabel('❌ Delete').setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId(`del_${signalId}`).setLabel('❌ Delete').setStyle(ButtonStyle.Secondary)
   );
   return [row1, row2, row3, row4];
 }
 
-async function createControlThread(signal) {
-  const channel = await client.channels.fetch(signal.channelId); // per-signal channel
-  const thread = await channel.threads.create({
-    name: `controls-${signal.asset}-${signal.id.slice(0, 4)}`,
-    type: ChannelType.PrivateThread,
-    invitable: false
-  });
-  // add owner + creator
-  try { await thread.members.add(config.ownerId); } catch {}
-  if (signal.creatorId && signal.creatorId !== config.ownerId) {
-    try { await thread.members.add(signal.creatorId); } catch {}
+async function createControlThread(signal, initiatorId) {
+  try {
+    const channel = await client.channels.fetch(signal.channelId);
+    const thread = await channel.threads.create({
+      name: `controls-${signal.asset}-${signal.id.slice(0,4)}`,
+      type: ChannelType.PrivateThread,
+      invitable: false,
+    });
+    // Add owner + initiator
+    await thread.members.add(cfg.ownerId).catch(()=>{});
+    if (initiatorId && initiatorId !== cfg.ownerId) {
+      await thread.members.add(initiatorId).catch(()=>{});
+    }
+    await setThreadId(signal.id, thread.id);
+    await thread.send({ content: 'Owner Control Panel', components: controlRows(signal.id) });
+    return thread.id;
+  } catch (e) {
+    console.error('createControlThread error:', e);
+    return null;
   }
-  await setThreadId(signal.id, thread.id);
-  await thread.send({ content: 'Owner Control Panel', components: controlRows(signal.id) });
-  return thread.id;
 }
 
 async function deleteControlThread(signalId) {
@@ -342,35 +345,35 @@ async function deleteControlThread(signalId) {
 // Modals
 // ------------------------------
 function makeTPModal(id, tpKey) {
-  const m = new ModalBuilder().setCustomId(modal(id, `tp:${tpKey}`)).setTitle(`${tpKey.toUpperCase()} Hit`);
+  const modal = new ModalBuilder().setCustomId(`modal_tp_${tpKey}_${id}`).setTitle(`${tpKey.toUpperCase()} Hit`);
   const pct = new TextInputBuilder()
     .setCustomId('tp_pct')
     .setLabel('Close % (0 - 100; leave blank to skip)')
     .setStyle(TextInputStyle.Short)
     .setRequired(false);
-  m.addComponents(new ActionRowBuilder().addComponents(pct));
-  return m;
+  modal.addComponents(new ActionRowBuilder().addComponents(pct));
+  return modal;
 }
 function makeUpdateTPPricesModal(id) {
-  const m = new ModalBuilder().setCustomId(modal(id,'tpprices')).setTitle('Update TP Prices (TP1–TP5)');
+  const modal = new ModalBuilder().setCustomId(`modal_tpprices_${id}`).setTitle('Update TP Prices (TP1–TP5)');
   for (const [cid, label] of [['upd_tp1','TP1'],['upd_tp2','TP2'],['upd_tp3','TP3'],['upd_tp4','TP4'],['upd_tp5','TP5']]) {
-    m.addComponents(new ActionRowBuilder().addComponents(
+    modal.addComponents(new ActionRowBuilder().addComponents(
       new TextInputBuilder().setCustomId(cid).setLabel(label).setStyle(TextInputStyle.Short).setRequired(false)
     ));
   }
-  return m;
+  return modal;
 }
 function makeUpdatePlanModal(id) {
-  const m = new ModalBuilder().setCustomId(modal(id,'plan')).setTitle('Update TP % Plan (0–100)');
+  const modal = new ModalBuilder().setCustomId(`modal_plan_${id}`).setTitle('Update TP % Plan (0–100)');
   for (const t of ['tp1','tp2','tp3','tp4','tp5']) {
-    m.addComponents(new ActionRowBuilder().addComponents(
+    modal.addComponents(new ActionRowBuilder().addComponents(
       new TextInputBuilder().setCustomId(`plan_${t}`).setLabel(`${t.toUpperCase()} planned %`).setStyle(TextInputStyle.Short).setRequired(false)
     ));
   }
-  return m;
+  return modal;
 }
 function makeUpdateTradeInfoModal(id) {
-  const m = new ModalBuilder().setCustomId(modal(id,'trade')).setTitle('Update Trade Info');
+  const modal = new ModalBuilder().setCustomId(`modal_trade_${id}`).setTitle('Update Trade Info');
   const fields = [
     ['upd_entry', 'Entry', TextInputStyle.Short],
     ['upd_sl', 'SL', TextInputStyle.Short],
@@ -379,51 +382,135 @@ function makeUpdateTradeInfoModal(id) {
     ['upd_reason', 'Reason (optional)', TextInputStyle.Paragraph],
   ];
   for (const [cid, label, style] of fields) {
-    m.addComponents(new ActionRowBuilder().addComponents(
+    modal.addComponents(new ActionRowBuilder().addComponents(
       new TextInputBuilder().setCustomId(cid).setLabel(label).setStyle(style).setRequired(false)
     ));
   }
-  return m;
+  return modal;
 }
 function makeUpdateRolesModal(id) {
-  const m = new ModalBuilder().setCustomId(modal(id,'roles')).setTitle('Update Role Mention(s)');
+  const modal = new ModalBuilder().setCustomId(`modal_roles_${id}`).setTitle('Update Role Mention(s)');
   const input = new TextInputBuilder()
     .setCustomId('roles_input')
     .setLabel('Enter one or more roles (IDs or @mentions)')
     .setStyle(TextInputStyle.Paragraph)
     .setRequired(false);
-  m.addComponents(new ActionRowBuilder().addComponents(input));
-  return m;
+  modal.addComponents(new ActionRowBuilder().addComponents(input));
+  return modal;
 }
 function makeFullCloseModal(id) {
-  const m = new ModalBuilder().setCustomId(modal(id,'full')).setTitle('Fully Close Position');
+  const modal = new ModalBuilder().setCustomId(`modal_full_${id}`).setTitle('Fully Close Position');
   const price = new TextInputBuilder().setCustomId('close_price').setLabel('Close Price').setStyle(TextInputStyle.Short).setRequired(true);
   const pct = new TextInputBuilder().setCustomId('close_pct').setLabel('Close % (default = remaining)').setStyle(TextInputStyle.Short).setRequired(false);
-  const finalR = new TextInputBuilder().setCustomId('final_r').setLabel('Final R (optional)').setPlaceholder('e.g., 0, -0.5, -1 — overrides calc').setStyle(TextInputStyle.Short).setRequired(false);
-  m.addComponents(new ActionRowBuilder().addComponents(price));
-  m.addComponents(new ActionRowBuilder().addComponents(pct));
-  m.addComponents(new ActionRowBuilder().addComponents(finalR));
-  return m;
+  const finalR = new TextInputBuilder()
+    .setCustomId('final_r')
+    .setLabel('Final R (optional)')
+    .setPlaceholder('e.g., 0, -0.5, -1 — overrides calc')
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false);
+  modal.addComponents(new ActionRowBuilder().addComponents(price));
+  modal.addComponents(new ActionRowBuilder().addComponents(pct));
+  modal.addComponents(new ActionRowBuilder().addComponents(finalR));
+  return modal;
 }
 function makeFinalRModal(id, kind) {
-  const m = new ModalBuilder().setCustomId(modal(id, `finalr:${kind}`)).setTitle(kind === 'BE' ? 'Stopped Breakeven' : 'Stopped Out');
-  const r = new TextInputBuilder().setCustomId('final_r').setLabel('Final R (optional)').setPlaceholder('e.g., 0, -0.5, -1 — overrides calc').setStyle(TextInputStyle.Short).setRequired(false);
-  m.addComponents(new ActionRowBuilder().addComponents(r));
-  return m;
+  const modal = new ModalBuilder().setCustomId(`modal_finalr_${kind}_${id}`).setTitle(kind === 'BE' ? 'Stopped Breakeven' : 'Stopped Out');
+  const r = new TextInputBuilder()
+    .setCustomId('final_r')
+    .setLabel('Final R (optional)')
+    .setPlaceholder('e.g., 0, -0.5, -1 — overrides calc')
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false);
+  modal.addComponents(new ActionRowBuilder().addComponents(r));
+  return modal;
 }
 
 // ------------------------------
-// Bot lifecycle
+// Common helpers for interactions
+// ------------------------------
+const claimed = new Set(); // dedupe
+function tryClaimInteraction(interaction) {
+  const key = interaction.id;
+  if (claimed.has(key)) return false;
+  claimed.add(key);
+  setTimeout(() => claimed.delete(key), 30_000);
+  return true;
+}
+async function ensureDeferred(interaction) {
+  try {
+    if (!interaction.deferred && !interaction.replied) {
+      await interaction.deferReply({ ephemeral: true });
+    }
+  } catch {}
+}
+async function safeEditReply(interaction, payload) {
+  try {
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply(payload);
+    } else {
+      await interaction.reply({ ...payload, ephemeral: true });
+    }
+  } catch (e) {
+    console.error('safeEditReply error:', e);
+  }
+}
+
+// ------------------------------
+// Bot lifecycle + command registration
 // ------------------------------
 client.once('ready', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
-  await pruneGhostSignals().catch(() => {});
+
+  // Upsert /drako command on startup (guild-scoped)
+  const rest = new REST({ version: '10' }).setToken(cfg.token);
+  const cmd = {
+    name: 'drako',
+    description: 'Post a trade signal (Drako)',
+    default_member_permissions: String(PermissionFlagsBits.SendMessages),
+    dm_permission: false,
+    options: [
+      { name: 'asset', type: 3, description: 'Asset (BTC/ETH/SOL/OTHER)', required: true, choices: [
+        { name: 'BTC', value: 'BTC' },
+        { name: 'ETH', value: 'ETH' },
+        { name: 'SOL', value: 'SOL' },
+        { name: 'OTHER', value: 'OTHER' },
+      ]},
+      { name: 'direction', type: 3, description: 'LONG or SHORT', required: true, choices: [
+        { name: 'LONG', value: 'LONG' },
+        { name: 'SHORT', value: 'SHORT' },
+      ]},
+      { name: 'entry', type: 3, description: 'Entry price', required: true },
+      { name: 'sl', type: 3, description: 'Stop loss', required: true },
+      { name: 'tp1', type: 3, description: 'TP1', required: false },
+      { name: 'tp2', type: 3, description: 'TP2', required: false },
+      { name: 'tp3', type: 3, description: 'TP3', required: false },
+      { name: 'tp4', type: 3, description: 'TP4', required: false },
+      { name: 'tp5', type: 3, description: 'TP5', required: false },
+      { name: 'reason', type: 3, description: 'Reason (optional)', required: false },
+      { name: 'extra_role', type: 3, description: 'Additional role mentions (@roles or IDs, optional)', required: false },
+      { name: 'tp1_pct', type: 3, description: 'Planned % for TP1', required: false },
+      { name: 'tp2_pct', type: 3, description: 'Planned % for TP2', required: false },
+      { name: 'tp3_pct', type: 3, description: 'Planned % for TP3', required: false },
+      { name: 'tp4_pct', type: 3, description: 'Planned % for TP4', required: false },
+      { name: 'tp5_pct', type: 3, description: 'Planned % for TP5', required: false },
+    ],
+  };
+
+  try {
+    await rest.put(
+      Routes.applicationGuildCommands(cfg.applicationId, cfg.guildId),
+      { body: [cmd] }
+    );
+    console.log('✅ /drako command registered');
+  } catch (e) {
+    console.error('Failed to register /drako:', e);
+  }
 });
 
-// Manual delete watcher (any channel)
+// Manual delete watcher (ANY channel)
 client.on('messageDelete', async (message) => {
   try {
-    if (!message) return; // match by messageId
+    if (!message) return;
     const sigs = await getSignals();
     const found = sigs.find(s => s.messageId === message.id);
     if (!found) return;
@@ -436,62 +523,31 @@ client.on('messageDelete', async (message) => {
   }
 });
 
-client.on('messageDeleteBulk', async (collection) => {
-  try {
-    const ids = new Set(Array.from(collection.keys()));
-    const sigs = await getSignals();
-    const toRemove = sigs.filter(s => ids.has(s.messageId));
-    for (const s of toRemove) {
-      await deleteControlThread(s.id).catch(() => {});
-      await deleteSignal(s.id).catch(() => {});
-    }
-    if (toRemove.length) await updateSummary().catch(() => {});
-  } catch (e) {
-    console.error('messageDeleteBulk handler error:', e);
-  }
-});
+// ------------------------------
+// Interactions
+// ------------------------------
+const pendingSignals = new Map();
 
-// ------------------------------
-// Interactions (dedupe guard)
-// ------------------------------
-const claimed = new Set();
-const CLAIM_TTL_MS = 60_000;
-function tryClaimInteraction(interaction) {
-  const id = interaction.id;
-  if (claimed.has(id)) return false;
-  claimed.add(id);
-  setTimeout(() => claimed.delete(id), CLAIM_TTL_MS);
-  return true;
-}
-
-// Role check helper for /drako
-function canUseDrako(interaction) {
-  if (interaction.user.id === config.ownerId) return true;
-  const roles = interaction.member?.roles;
-  // roles?.cache works on interactions in guilds
-  if (roles?.cache?.has?.(DRAKO_ROLE_ID)) return true;
-  // fallback to raw role IDs if present
-  const raw = interaction.member?.roles;
-  if (raw && raw.includes && typeof raw.includes === 'function') {
-    return raw.includes(DRAKO_ROLE_ID);
-  }
-  return false;
-}
-
-// ------------------------------
-// Interaction router
-// ------------------------------
 client.on('interactionCreate', async (interaction) => {
   try {
-    if (!tryClaimInteraction(interaction)) return;
+    if (!tryClaimInteraction(interaction)) return; // dedupe
 
-    // /signal (owner only) — namespace: main
-    if (interaction.isChatInputCommand() && interaction.commandName === 'signal') {
-      if (interaction.user.id !== config.ownerId) {
-        return interaction.reply({ content: 'Only the owner can use this command.', flags: MessageFlags.Ephemeral });
-      }
-      await ensureDeferred(interaction);
+    // Gate: owner or trader role only
+    const member = interaction.member;
+    const allowed = interaction.user.id === cfg.ownerId ||
+                    (member && member.roles && member.roles.cache?.has?.(cfg.mentionRoleId));
+    if (interaction.isChatInputCommand() && interaction.commandName === 'drako' && !allowed) {
+      return interaction.reply({ content: 'You are not allowed to use this command.', ephemeral: true });
+    }
+    if (interaction.isButton() && !allowed) {
+      return interaction.reply({ content: 'You are not allowed to use these controls.', ephemeral: true });
+    }
+    if (interaction.isModalSubmit() && !allowed) {
+      return interaction.reply({ content: 'You are not allowed to use these controls.', ephemeral: true });
+    }
 
+    // /drako
+    if (interaction.isChatInputCommand() && interaction.commandName === 'drako') {
       const assetSel   = interaction.options.getString('asset');
       const direction  = interaction.options.getString('direction');
       const entry      = interaction.options.getString('entry');
@@ -512,31 +568,32 @@ client.on('interactionCreate', async (interaction) => {
 
       if (assetSel === 'OTHER') {
         const pid = nano();
-        const m = new ModalBuilder().setCustomId(modal(pid,'asset_main')).setTitle('Enter custom asset');
+        const modal = new ModalBuilder().setCustomId(`modal_asset_${pid}`).setTitle('Enter custom asset');
         const input = new TextInputBuilder().setCustomId('asset_value').setLabel('Asset (e.g., PEPE, XRP)').setStyle(TextInputStyle.Short).setRequired(true);
-        m.addComponents(new ActionRowBuilder().addComponents(input));
+        modal.addComponents(new ActionRowBuilder().addComponents(input));
         pendingSignals.set(pid, {
-          namespace: 'main',
-          creatorId: config.ownerId,
           direction, entry, sl, tp1, tp2, tp3, tp4, tp5, reason, extraRole,
+          channelId: interaction.channelId,
+          initiatorId: interaction.user.id,
           plan: {
             TP1: isNum(tp1_pct) ? Number(tp1_pct) : null,
             TP2: isNum(tp2_pct) ? Number(tp2_pct) : null,
             TP3: isNum(tp3_pct) ? Number(tp3_pct) : null,
             TP4: isNum(tp4_pct) ? Number(tp4_pct) : null,
             TP5: isNum(tp5_pct) ? Number(tp5_pct) : null,
-          },
-          channelId: interaction.channelId,
+          }
         });
-        return interaction.showModal(m);
+        return interaction.showModal(modal);
       }
 
+      await ensureDeferred(interaction);
       await createSignal({
-        namespace: 'main',
-        creatorId: config.ownerId,
         asset: assetSel,
-        direction, entry, sl, tp1, tp2, tp3, tp4, tp5,
+        direction,
+        entry, sl, tp1, tp2, tp3, tp4, tp5,
         reason, extraRole,
+        channelId: interaction.channelId,
+        initiatorId: interaction.user.id,
         plan: {
           TP1: isNum(tp1_pct) ? Number(tp1_pct) : null,
           TP2: isNum(tp2_pct) ? Number(tp2_pct) : null,
@@ -544,346 +601,277 @@ client.on('interactionCreate', async (interaction) => {
           TP4: isNum(tp4_pct) ? Number(tp4_pct) : null,
           TP5: isNum(tp5_pct) ? Number(tp5_pct) : null,
         }
-      }, interaction.channelId);
+      });
       return safeEditReply(interaction, { content: '✅ Trade signal posted.' });
     }
 
-    // /drako (role or owner) — namespace: drako
-    if (interaction.isChatInputCommand() && interaction.commandName === 'drako') {
-      if (!canUseDrako(interaction)) {
-        return interaction.reply({ content: 'You do not have permission to use this command.', flags: MessageFlags.Ephemeral });
-      }
+    // custom asset modal
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_asset_')) {
       await ensureDeferred(interaction);
-
-      const assetSel   = interaction.options.getString('asset');
-      const direction  = interaction.options.getString('direction');
-      const entry      = interaction.options.getString('entry');
-      const sl         = interaction.options.getString('sl');
-      const tp1        = interaction.options.getString('tp1');
-      const tp2        = interaction.options.getString('tp2');
-      const tp3        = interaction.options.getString('tp3');
-      const tp4        = interaction.options.getString('tp4');
-      const tp5        = interaction.options.getString('tp5');
-      const reason     = interaction.options.getString('reason');
-      const extraRole  = interaction.options.getString('extra_role');
-
-      const tp1_pct = interaction.options.getString('tp1_pct');
-      const tp2_pct = interaction.options.getString('tp2_pct');
-      const tp3_pct = interaction.options.getString('tp3_pct');
-      const tp4_pct = interaction.options.getString('tp4_pct');
-      const tp5_pct = interaction.options.getString('tp5_pct');
-
-      if (assetSel === 'OTHER') {
-        const pid = nano();
-        const m = new ModalBuilder().setCustomId(modal(pid,'asset_drako')).setTitle('Enter custom asset');
-        const input = new TextInputBuilder().setCustomId('asset_value').setLabel('Asset (e.g., PEPE, XRP)').setStyle(TextInputStyle.Short).setRequired(true);
-        m.addComponents(new ActionRowBuilder().addComponents(input));
-        pendingSignals.set(pid, {
-          namespace: 'drako',
-          creatorId: interaction.user.id,
-          direction, entry, sl, tp1, tp2, tp3, tp4, tp5, reason, extraRole,
-          plan: {
-            TP1: isNum(tp1_pct) ? Number(tp1_pct) : null,
-            TP2: isNum(tp2_pct) ? Number(tp2_pct) : null,
-            TP3: isNum(tp3_pct) ? Number(tp3_pct) : null,
-            TP4: isNum(tp4_pct) ? Number(tp4_pct) : null,
-            TP5: isNum(tp5_pct) ? Number(tp5_pct) : null,
-          },
-          channelId: interaction.channelId,
-        });
-        return interaction.showModal(m);
-      }
-
-      await createSignal({
-        namespace: 'drako',
-        creatorId: interaction.user.id,
-        asset: assetSel,
-        direction, entry, sl, tp1, tp2, tp3, tp4, tp5,
-        reason, extraRole,
-        plan: {
-          TP1: isNum(tp1_pct) ? Number(tp1_pct) : null,
-          TP2: isNum(tp2_pct) ? Number(tp2_pct) : null,
-          TP3: isNum(tp3_pct) ? Number(tp3_pct) : null,
-          TP4: isNum(tp4_pct) ? Number(tp4_pct) : null,
-          TP5: isNum(tp5_pct) ? Number(tp5_pct) : null,
-        }
-      }, interaction.channelId);
-      return safeEditReply(interaction, { content: '✅ Drako trade signal posted.' });
+      const pid = interaction.customId.replace('modal_asset_', '');
+      const stash = pendingSignals.get(pid);
+      pendingSignals.delete(pid);
+      if (!stash) return safeEditReply(interaction, { content: '❌ Session expired. Try /drako again.' });
+      const asset = interaction.fields.getTextInputValue('asset_value').trim().toUpperCase();
+      await createSignal({ asset, ...stash });
+      return safeEditReply(interaction, { content: `✅ Trade signal posted for ${asset}.` });
     }
 
-    // ===== MODALS =====
-    if (interaction.isModalSubmit()) {
-      const [_, kind, rest] = interaction.customId.split(':'); // modal, kind, ...
-      const tail = interaction.customId.split(':');
-      const idPart = tail[tail.length - 1];
+    // ===== UPDATE FLOWS =====
 
-      // Custom asset (main / drako)
-      if (kind === 'asset_main' || kind === 'asset_drako') {
-        await ensureDeferred(interaction);
-        const stash = pendingSignals.get(idPart);
-        pendingSignals.delete(idPart);
-        if (!stash) return safeEditReply(interaction, { content: '❌ Session expired. Try again.' });
-        const asset = interaction.fields.getTextInputValue('asset_value').trim().toUpperCase();
-        await createSignal({ asset, ...stash }, stash.channelId || interaction.channelId);
-        const label = stash.namespace === 'drako' ? 'Drako trade signal' : 'Trade signal';
-        return safeEditReply(interaction, { content: `✅ ${label} posted for ${asset}.` });
+    // Update TP Prices (TP1–TP5)
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_tpprices_')) {
+      await ensureDeferred(interaction);
+      const id = interaction.customId.replace('modal_tpprices_', '');
+      const signal = await getSignal(id);
+      if (!signal) return safeEditReply(interaction, { content: 'Signal not found.' });
+
+      const patch = {};
+      for (const k of ['tp1','tp2','tp3','tp4','tp5']) {
+        const v = interaction.fields.getTextInputValue(`upd_${k}`)?.trim();
+        if (v !== undefined && v !== '') patch[k] = v;
       }
 
-      // Update/TP/Close/FinalR — same as before
-      if (kind === 'tpprices' || kind === 'plan' || kind === 'trade' || kind === 'roles' ||
-          kind?.startsWith('tp') || kind === 'full' || kind?.startsWith('finalr')) {
-        await ensureDeferred(interaction);
-      }
+      await updateSignal(id, patch);
+      const updated = normalizeSignal(await getSignal(id));
+      if (isSlMovedToBE(updated)) { updated.validReentry = false; await updateSignal(id, { validReentry: false }); }
 
-      // Update TP Prices
-      if (kind === 'tpprices') {
-        const id = idPart;
-        const signal = await getSignal(id);
-        if (!signal) return safeEditReply(interaction, { content: 'Signal not found.' });
-        if (!canControl(interaction.user.id, signal)) return safeEditReply(interaction, { content: 'No permission.' });
-
-        const patch = {};
-        for (const k of ['tp1','tp2','tp3','tp4','tp5']) {
-          const v = interaction.fields.getTextInputValue(`upd_${k}`)?.trim();
-          if (v !== undefined && v !== '') patch[k] = v;
-        }
-        await updateSignal(id, { ...patch });
-        const updated = normalizeSignal(await getSignal(id));
-        if (isSlMovedToBE(updated)) { updated.validReentry = false; await updateSignal(id, { validReentry: false }); }
-        await editSignalMessage(updated);
-        await updateSummary();
-        return safeEditReply(interaction, { content: '✅ TP prices updated.' });
-      }
-
-      // Update Plan
-      if (kind === 'plan') {
-        const id = idPart;
-        const sig = normalizeSignal(await getSignal(id));
-        if (!sig) return safeEditReply(interaction, { content: 'Signal not found.' });
-        if (!canControl(interaction.user.id, sig)) return safeEditReply(interaction, { content: 'No permission.' });
-
-        const patchPlan = { ...sig.plan };
-        for (const t of ['tp1','tp2','tp3','tp4','tp5']) {
-          const raw = interaction.fields.getTextInputValue(`plan_${t}`)?.trim();
-          if (raw === '' || raw === undefined) continue;
-          if (isNum(raw)) patchPlan[t.toUpperCase()] = Math.max(0, Math.min(100, Number(raw)));
-        }
-        await updateSignal(id, { plan: patchPlan });
-        await editSignalMessage(normalizeSignal(await getSignal(id)));
-        await updateSummary();
-        return safeEditReply(interaction, { content: '✅ TP % plan updated.' });
-      }
-
-      // Update Trade Info
-      if (kind === 'trade') {
-        const id = idPart;
-        const signal = await getSignal(id);
-        if (!signal) return safeEditReply(interaction, { content: 'Signal not found.' });
-        if (!canControl(interaction.user.id, signal)) return safeEditReply(interaction, { content: 'No permission.' });
-
-        const patch = {};
-        const entry     = interaction.fields.getTextInputValue('upd_entry')?.trim();
-        const sl        = interaction.fields.getTextInputValue('upd_sl')?.trim();
-        const asset     = interaction.fields.getTextInputValue('upd_asset')?.trim();
-        const dir       = interaction.fields.getTextInputValue('upd_dir')?.trim()?.toUpperCase();
-        const reason    = interaction.fields.getTextInputValue('upd_reason')?.trim();
-
-        if (entry) patch.entry = entry;
-        if (sl)    patch.sl = sl;
-        if (asset) patch.asset = asset.toUpperCase();
-        if (dir === 'LONG' || dir === 'SHORT') patch.direction = dir;
-        if (reason !== undefined) patch.reason = reason;
-
-        await updateSignal(id, patch);
-        const updated = normalizeSignal(await getSignal(id));
-        if (isSlMovedToBE(updated)) { updated.validReentry = false; await updateSignal(id, { validReentry: false }); }
-        await editSignalMessage(updated);
-        await updateSummary();
-        return safeEditReply(interaction, { content: '✅ Trade info updated.' });
-      }
-
-      // Update Roles
-      if (kind === 'roles') {
-        const id = idPart;
-        const signal = await getSignal(id);
-        if (!signal) return safeEditReply(interaction, { content: 'Signal not found.' });
-        if (!canControl(interaction.user.id, signal)) return safeEditReply(interaction, { content: 'No permission.' });
-
-        const rolesRaw = interaction.fields.getTextInputValue('roles_input') ?? '';
-        await updateSignal(id, { extraRole: rolesRaw });
-        await editSignalMessage(normalizeSignal(await getSignal(id)));
-        await updateSummary();
-        return safeEditReply(interaction, { content: '✅ Role mentions updated.' });
-      }
-
-      // TP modal submit
-      if (kind?.startsWith('tp')) {
-        const parts = interaction.customId.split(':'); // modal, tp, tpX, id
-        const tpKey = parts[2]; // tp1..tp5
-        const id = parts[3];
-
-        let signal = normalizeSignal(await getSignal(id));
-        if (!signal) return safeEditReply(interaction, { content: 'Signal not found.' });
-        if (!canControl(interaction.user.id, signal)) return safeEditReply(interaction, { content: 'No permission.' });
-
-        const tpUpper = tpKey.toUpperCase();
-        if (signal.tpHits?.[tpUpper]) return safeEditReply(interaction, { content: `${tpUpper} already recorded.` });
-
-        const pctRaw = interaction.fields.getTextInputValue('tp_pct')?.trim();
-        const hasPct = pctRaw !== undefined && pctRaw !== null && pctRaw !== '';
-        const pct = hasPct ? Number(pctRaw) : null;
-        if (hasPct && (isNaN(pct) || pct < 0 || pct > 100)) {
-          return safeEditReply(interaction, { content: '❌ Close % must be between 0 and 100 (or leave blank to skip).' });
-        }
-        const tpPrice = signal[tpKey];
-        if (hasPct && pct > 0 && isNum(tpPrice)) {
-          const already = (signal.fills || []).some(f => String(f.source).toUpperCase() === tpUpper);
-          if (!already) signal.fills.push({ pct: Number(pct), price: Number(tpPrice), source: tpUpper });
-        }
-        signal.latestTpHit = tpUpper;
-        signal.tpHits[tpUpper] = true;
-
-        await updateSignal(id, { fills: signal.fills, latestTpHit: signal.latestTpHit, tpHits: signal.tpHits });
-        await editSignalMessage(signal);
-        await updateSummary();
-        return safeEditReply(interaction, { content: `✅ ${tpUpper} recorded${hasPct && pct > 0 ? ` (${pct}%).` : '.'}` });
-      }
-
-      // Fully close
-      if (kind === 'full') {
-        const id = idPart;
-        let signal = normalizeSignal(await getSignal(id));
-        if (!signal) return safeEditReply(interaction, { content: 'Signal not found.' });
-        if (!canControl(interaction.user.id, signal)) return safeEditReply(interaction, { content: 'No permission.' });
-
-        const finalRStr = interaction.fields.getTextInputValue('final_r')?.trim();
-        const hasFinalR = finalRStr !== undefined && finalRStr !== '';
-        if (hasFinalR && !isNum(finalRStr)) {
-          return safeEditReply(interaction, { content: '❌ Final R must be a number if provided.' });
-        }
-
-        if (hasFinalR) {
-          signal.finalR = Number(finalRStr);
-        } else {
-          const price = Number(interaction.fields.getTextInputValue('close_price')?.trim());
-          if (!isNum(price)) return safeEditReply(interaction, { content: '❌ Close Price must be a number.' });
-
-          const currentPct = (signal.fills || []).reduce((acc, f) => acc + Number(f.pct || 0), 0);
-          let pctStr = interaction.fields.getTextInputValue('close_pct')?.trim();
-          let pct = isNum(pctStr) ? Number(pctStr) : Math.max(0, 100 - currentPct);
-          if (pct < 0 || pct > 100) pct = Math.max(0, Math.min(100, pct));
-          if (pct > 0) signal.fills.push({ pct, price, source: 'FINAL_CLOSE' });
-        }
-
-        const latest = signal.latestTpHit || TP_KEYS.find(k => signal[k] !== null)?.toUpperCase() || null;
-        signal.status = STATUS.CLOSED;
-        signal.validReentry = false;
-        signal.latestTpHit = latest;
-
-        await updateSignal(id, { fills: signal.fills, status: signal.status, validReentry: false, latestTpHit: latest, ...(hasFinalR ? { finalR: signal.finalR } : {}) });
-        await editSignalMessage(signal);
-        await updateSummary();
-        return safeEditReply(interaction, { content: '✅ Fully closed.' });
-      }
-
-      // Final R (Stopped BE/Out)
-      if (kind?.startsWith('finalr')) {
-        const parts = interaction.customId.split(':'); // modal, finalr, BE/OUT, id
-        const fKind = parts[2];
-        const id = parts[3];
-
-        let signal = normalizeSignal(await getSignal(id));
-        if (!signal) return safeEditReply(interaction, { content: 'Signal not found.' });
-        if (!canControl(interaction.user.id, signal)) return safeEditReply(interaction, { content: 'No permission.' });
-
-        const finalRStr = interaction.fields.getTextInputValue('final_r')?.trim();
-        const hasFinalR = finalRStr !== undefined && finalRStr !== '';
-        if (hasFinalR && !isNum(finalRStr)) {
-          return safeEditReply(interaction, { content: '❌ Final R must be a number (e.g., 0, -1, -0.5).' });
-        }
-
-        if (hasFinalR) {
-          signal.finalR = Number(finalRStr);
-        } else {
-          let price = null;
-          price = Number(fKind === 'BE' ? signal.entry : (signal.slOriginal ?? signal.sl));
-          const remaining = 100 - (signal.fills || []).reduce((a, f) => a + Number(f.pct || 0), 0);
-          if (remaining > 0 && isNum(price)) {
-            signal.fills.push({ pct: remaining, price, source: fKind === 'BE' ? 'STOP_BE' : 'STOP_OUT' });
-          }
-        }
-
-        signal.status = (fKind === 'BE') ? STATUS.STOPPED_BE : STATUS.STOPPED_OUT;
-        signal.validReentry = false;
-
-        await updateSignal(id, { fills: signal.fills, status: signal.status, validReentry: false, ...(hasFinalR ? { finalR: signal.finalR } : {}) });
-        await editSignalMessage(signal);
-        await updateSummary();
-        await deleteControlThread(id);
-        return safeEditReply(interaction, { content: fKind === 'BE' ? '✅ Stopped at breakeven.' : '✅ Stopped out.' });
-      }
+      await editSignalMessage(updated);
+      await updateSummary();
+      return safeEditReply(interaction, { content: '✅ TP prices updated.' });
     }
 
-    // ===== BUTTONS =====
+    // Update TP % Plan
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_plan_')) {
+      await ensureDeferred(interaction);
+      const id = interaction.customId.replace('modal_plan_', '');
+      const sig = normalizeSignal(await getSignal(id));
+      if (!sig) return safeEditReply(interaction, { content: 'Signal not found.' });
+
+      const patchPlan = { ...sig.plan };
+      for (const t of ['tp1','tp2','tp3','tp4','tp5']) {
+        const raw = interaction.fields.getTextInputValue(`plan_${t}`)?.trim();
+        if (raw === '' || raw === undefined) continue;
+        if (isNum(raw)) patchPlan[t.toUpperCase()] = Math.max(0, Math.min(100, Number(raw)));
+      }
+      await updateSignal(id, { plan: patchPlan });
+
+      await editSignalMessage(normalizeSignal(await getSignal(id)));
+      await updateSummary();
+      return safeEditReply(interaction, { content: '✅ TP % plan updated.' });
+    }
+
+    // Update Trade Info
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_trade_')) {
+      await ensureDeferred(interaction);
+      const id = interaction.customId.replace('modal_trade_', '');
+      const signal = await getSignal(id);
+      if (!signal) return safeEditReply(interaction, { content: 'Signal not found.' });
+
+      const patch = {};
+      const entry     = interaction.fields.getTextInputValue('upd_entry')?.trim();
+      const sl        = interaction.fields.getTextInputValue('upd_sl')?.trim();
+      const asset     = interaction.fields.getTextInputValue('upd_asset')?.trim();
+      const dir       = interaction.fields.getTextInputValue('upd_dir')?.trim()?.toUpperCase();
+      const reason    = interaction.fields.getTextInputValue('upd_reason')?.trim();
+
+      if (entry) patch.entry = entry;
+      if (sl)    patch.sl = sl;
+      if (asset) patch.asset = asset.toUpperCase();
+      if (dir === 'LONG' || dir === 'SHORT') patch.direction = dir;
+      if (reason !== undefined) patch.reason = reason;
+
+      await updateSignal(id, patch);
+      const updated = normalizeSignal(await getSignal(id));
+      if (isSlMovedToBE(updated)) { updated.validReentry = false; await updateSignal(id, { validReentry: false }); }
+
+      await editSignalMessage(updated);
+      await updateSummary();
+      return safeEditReply(interaction, { content: '✅ Trade info updated.' });
+    }
+
+    // Update Role Mention(s)
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_roles_')) {
+      await ensureDeferred(interaction);
+      const id = interaction.customId.replace('modal_roles_', '');
+      const signal = await getSignal(id);
+      if (!signal) return safeEditReply(interaction, { content: 'Signal not found.' });
+
+      const rolesRaw = interaction.fields.getTextInputValue('roles_input') ?? '';
+      await updateSignal(id, { extraRole: rolesRaw });
+
+      await editSignalMessage(normalizeSignal(await getSignal(id)));
+      await updateSummary();
+      return safeEditReply(interaction, { content: '✅ Role mentions updated.' });
+    }
+
+    // TP Hit modal submit (optional %; one-time)
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_tp_')) {
+      await ensureDeferred(interaction);
+      const [_prefix, _tp, tpKey, id] = interaction.customId.split('_'); // modal_tp_tp1_<id>
+      let signal = normalizeSignal(await getSignal(id));
+      if (!signal) return safeEditReply(interaction, { content: 'Signal not found.' });
+
+      const tpUpper = tpKey.toUpperCase();
+      if (signal.tpHits?.[tpUpper]) {
+        return safeEditReply(interaction, { content: `${tpUpper} already recorded.` });
+      }
+
+      const pctRaw = interaction.fields.getTextInputValue('tp_pct')?.trim();
+      const hasPct = pctRaw !== undefined && pctRaw !== null && pctRaw !== '';
+      const pct = hasPct ? Number(pctRaw) : null;
+      if (hasPct && (isNaN(pct) || pct < 0 || pct > 100)) {
+        return safeEditReply(interaction, { content: '❌ Close % must be between 0 and 100 (or leave blank to skip).' });
+      }
+      const tpPrice = signal[tpKey];
+      if (hasPct && pct > 0 && isNum(tpPrice)) {
+        const already = (signal.fills || []).some(f => String(f.source).toUpperCase() === tpUpper);
+        if (!already) signal.fills.push({ pct: Number(pct), price: Number(tpPrice), source: tpUpper });
+      }
+      signal.latestTpHit = tpUpper;
+      signal.tpHits[tpUpper] = true;
+
+      await updateSignal(id, { fills: signal.fills, latestTpHit: signal.latestTpHit, tpHits: signal.tpHits });
+      await editSignalMessage(signal);
+      await updateSummary();
+      return safeEditReply(interaction, { content: `✅ ${tpUpper} recorded${hasPct && pct > 0 ? ` (${pct}%).` : '.'}` });
+    }
+
+    // Fully close modal (optional final R override)
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_full_')) {
+      await ensureDeferred(interaction);
+      const id = interaction.customId.replace('modal_full_', '');
+      let signal = normalizeSignal(await getSignal(id));
+      if (!signal) return safeEditReply(interaction, { content: 'Signal not found.' });
+
+      const finalRStr = interaction.fields.getTextInputValue('final_r')?.trim();
+      const hasFinalR = finalRStr !== undefined && finalRStr !== '';
+      if (hasFinalR && !isNum(finalRStr)) {
+        return safeEditReply(interaction, { content: '❌ Final R must be a number if provided.' });
+      }
+
+      if (hasFinalR) {
+        signal.finalR = Number(finalRStr);
+      } else {
+        const price = Number(interaction.fields.getTextInputValue('close_price')?.trim());
+        if (!isNum(price)) return safeEditReply(interaction, { content: '❌ Close Price must be a number.' });
+
+        const currentPct = (signal.fills || []).reduce((acc, f) => acc + Number(f.pct || 0), 0);
+        let pctStr = interaction.fields.getTextInputValue('close_pct')?.trim();
+        let pct = isNum(pctStr) ? Number(pctStr) : Math.max(0, 100 - currentPct);
+        if (pct < 0 || pct > 100) pct = Math.max(0, Math.min(100, pct));
+
+        if (pct > 0) signal.fills.push({ pct, price, source: 'FINAL_CLOSE' });
+      }
+
+      const latest = signal.latestTpHit || TP_KEYS.find(k => signal[k] !== null)?.toUpperCase() || null;
+      signal.status = STATUS.CLOSED;
+      signal.validReentry = false;
+      signal.latestTpHit = latest;
+
+      await updateSignal(id, { fills: signal.fills, status: signal.status, validReentry: false, latestTpHit: latest, ...(hasFinalR ? { finalR: signal.finalR } : {}) });
+      await editSignalMessage(signal);
+      await updateSummary();
+      return safeEditReply(interaction, { content: '✅ Fully closed.' });
+    }
+
+    // Final R modal (Stopped BE / Stopped Out)
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_finalr_')) {
+      await ensureDeferred(interaction);
+      const parts = interaction.customId.split('_'); // modal_finalr_BE_<id>
+      const kind = parts[2];
+      const id = parts.slice(3).join('_');
+      let signal = normalizeSignal(await getSignal(id));
+      if (!signal) return safeEditReply(interaction, { content: 'Signal not found.' });
+
+      const finalRStr = interaction.fields.getTextInputValue('final_r')?.trim();
+      const hasFinalR = finalRStr !== undefined && finalRStr !== '';
+      if (hasFinalR && !isNum(finalRStr)) {
+        return safeEditReply(interaction, { content: '❌ Final R must be a number (e.g., 0, -1, -0.5).' });
+      }
+
+      if (hasFinalR) {
+        signal.finalR = Number(finalRStr);
+      } else {
+        let price = null;
+        if (signal.direction === DIR.LONG) {
+          price = Number(signal.entry);
+          if (kind !== 'BE') price = Number(signal.slOriginal ?? signal.sl);
+        } else {
+          price = Number(signal.entry);
+          if (kind !== 'BE') price = Number(signal.slOriginal ?? signal.sl);
+        }
+        const remaining = 100 - (signal.fills || []).reduce((a, f) => a + Number(f.pct || 0), 0);
+        if (remaining > 0 && isNum(price)) {
+          signal.fills.push({ pct: remaining, price, source: kind === 'BE' ? 'STOP_BE' : 'STOP_OUT' });
+        }
+      }
+
+      signal.status = (kind === 'BE') ? STATUS.STOPPED_BE : STATUS.STOPPED_OUT;
+      signal.validReentry = false;
+
+      await updateSignal(id, { fills: signal.fills, status: signal.status, validReentry: false, ...(hasFinalR ? { finalR: signal.finalR } : {}) });
+      await editSignalMessage(signal);
+      await updateSummary();
+      await deleteControlThread(id);
+      return safeEditReply(interaction, { content: kind === 'BE' ? '✅ Stopped at breakeven.' : '✅ Stopped out.' });
+    }
+
+    // ===== Buttons =====
     if (interaction.isButton()) {
-      const parts = interaction.customId.split(':'); // btn, key..., id
-      const id = parts.pop();
-      const key = parts.slice(1).join(':'); // remove 'btn'
+      const [action, id] = interaction.customId.split('_');
+      if (!id) return interaction.reply({ content: 'Bad button ID.', ephemeral: true });
 
-      const sig = await getSignal(id).catch(() => null);
-      if (!sig) return interaction.reply({ content: 'Signal not found.', flags: MessageFlags.Ephemeral });
-      if (!canControl(interaction.user.id, sig)) {
-        return interaction.reply({ content: 'You do not have permission for this control.', flags: MessageFlags.Ephemeral });
-      }
+      if (action === 'upd_tpprices') return interaction.showModal(makeUpdateTPPricesModal(id));
+      if (action === 'upd_plan')     return interaction.showModal(makeUpdatePlanModal(id));
+      if (action === 'upd_trade')    return interaction.showModal(makeUpdateTradeInfoModal(id));
+      if (action === 'upd_roles')    return interaction.showModal(makeUpdateRolesModal(id));
+      if (action === 'fullclose')    return interaction.showModal(makeFullCloseModal(id));
+      if (action === 'stopbe')       return interaction.showModal(makeFinalRModal(id, 'BE'));
+      if (action === 'stopped')      return interaction.showModal(makeFinalRModal(id, 'OUT'));
 
-      // Show modals: DO NOT defer before showModal
-      if (key === 'upd:tpprices') return interaction.showModal(makeUpdateTPPricesModal(id));
-      if (key === 'upd:plan')     return interaction.showModal(makeUpdatePlanModal(id));
-      if (key === 'upd:trade')    return interaction.showModal(makeUpdateTradeInfoModal(id));
-      if (key === 'upd:roles')    return interaction.showModal(makeUpdateRolesModal(id));
-      if (key === 'fullclose')    return interaction.showModal(makeFullCloseModal(id));
-      if (key === 'stopbe')       return interaction.showModal(makeFinalRModal(id, 'BE'));
-      if (key === 'stopped')      return interaction.showModal(makeFinalRModal(id, 'OUT'));
-
-      if (key === 'del') {
+      if (action === 'del') {
         await ensureDeferred(interaction);
-        await deleteSignalMessage(normalizeSignal(sig)).catch(() => {});
-        await deleteControlThread(id).catch(() => {});
-        await deleteSignal(id).catch(() => {});
-        await updateSummary().catch(() => {});
+        const sig = await getSignal(id).catch(() => null);
+        if (sig) {
+          await deleteSignalMessage(sig).catch(() => {});
+          await deleteControlThread(id).catch(() => {});
+          await deleteSignal(id).catch(() => {});
+          await updateSummary().catch(() => {});
+        }
         return safeEditReply(interaction, { content: '🗑️ Signal deleted.' });
       }
 
-      if (['tp1','tp2','tp3','tp4','tp5'].includes(key)) {
-        const n = normalizeSignal(sig);
+      if (['tp1','tp2','tp3','tp4','tp5'].includes(action)) {
+        const sig = normalizeSignal(await getSignal(id));
+        if (!sig) return interaction.reply({ content: 'Signal not found.', ephemeral: true });
 
-        const tpUpper = key.toUpperCase();
-        if (n.tpHits?.[tpUpper]) {
-          return interaction.reply({ content: `${tpUpper} already recorded.`, flags: MessageFlags.Ephemeral });
+        const tpUpper = action.toUpperCase();
+        if (sig.tpHits?.[tpUpper]) {
+          return interaction.reply({ content: `${tpUpper} already recorded.`, ephemeral: true });
         }
 
-        const planPct = n.plan?.[tpUpper];
-        const tpPrice = n[key];
+        const planPct = sig.plan?.[tpUpper];
+        const tpPrice = sig[action];
 
         if (isNum(planPct) && Number(planPct) > 0 && isNum(tpPrice)) {
-          const already = (n.fills || []).some(f => String(f.source).toUpperCase() === tpUpper);
-          if (!already) n.fills.push({ pct: Number(planPct), price: Number(tpPrice), source: tpUpper });
-          n.latestTpHit = tpUpper;
-          n.tpHits[tpUpper] = true;
+          const already = (sig.fills || []).some(f => String(f.source).toUpperCase() === tpUpper);
+          if (!already) sig.fills.push({ pct: Number(planPct), price: Number(tpPrice), source: tpUpper });
+          sig.latestTpHit = tpUpper;
+          sig.tpHits[tpUpper] = true;
 
-          await updateSignal(id, { fills: n.fills, latestTpHit: n.latestTpHit, tpHits: n.tpHits });
-          await editSignalMessage(n);
+          await updateSignal(id, { fills: sig.fills, latestTpHit: sig.latestTpHit, tpHits: sig.tpHits });
+          await editSignalMessage(sig);
           await updateSummary();
-          await ensureDeferred(interaction);
-          return safeEditReply(interaction, { content: `✅ ${tpUpper} executed (${planPct}%).` });
+          return interaction.reply({ content: `✅ ${tpUpper} executed (${planPct}%).`, ephemeral: true });
         }
 
-        const m = makeTPModal(id, key);
-        if (isNum(planPct)) m.components[0].components[0].setValue(String(planPct));
-        return interaction.showModal(m);
+        const modal = makeTPModal(id, action);
+        if (isNum(planPct)) modal.components[0].components[0].setValue(String(planPct));
+        return interaction.showModal(modal);
       }
 
-      return interaction.reply({ content: 'Unknown action.', flags: MessageFlags.Ephemeral });
+      return interaction.reply({ content: 'Unknown action.', ephemeral: true });
     }
   } catch (err) {
     console.error('interaction error:', err);
@@ -891,7 +879,7 @@ client.on('interactionCreate', async (interaction) => {
       if (interaction.deferred || interaction.replied) {
         await interaction.editReply({ content: '❌ Internal error.' });
       } else {
-        await interaction.reply({ content: '❌ Internal error.', flags: MessageFlags.Ephemeral });
+        await interaction.reply({ content: '❌ Internal error.', ephemeral: true });
       }
     } catch {}
   }
@@ -900,13 +888,9 @@ client.on('interactionCreate', async (interaction) => {
 // ------------------------------
 // Create & Save Signal
 // ------------------------------
-const pendingSignals = new Map();
-
-async function createSignal(payload, channelId) {
+async function createSignal(payload) {
   const signal = normalizeSignal({
     id: nano(),
-    namespace: payload.namespace || 'main', // <— main | drako
-    creatorId: payload.creatorId || config.ownerId,
     asset: String(payload.asset || '').toUpperCase(),
     direction: (payload.direction || 'LONG').toUpperCase() === 'SHORT' ? DIR.SHORT : DIR.LONG,
     entry: payload.entry,
@@ -923,7 +907,7 @@ async function createSignal(payload, channelId) {
     finalR: null,
     messageId: null,
     jumpUrl: null,
-    channelId, // <= post and track in this channel
+    channelId: payload.channelId,
   });
 
   await saveSignal(signal);
@@ -935,44 +919,11 @@ async function createSignal(payload, channelId) {
   const msg = await channel.messages.fetch(msgId);
   signal.jumpUrl = msg.url;
 
-  await updateSignal(signal.id, { messageId: signal.messageId, jumpUrl: signal.jumpUrl });
-  await createControlThread(signal);
+  await updateSignal(signal.id, { messageId: signal.messageId, jumpUrl: signal.jumpUrl, channelId: signal.channelId });
+  await createControlThread(signal, payload.initiatorId);
   await updateSummary();
 
   return signal;
 }
 
-// ------------------------------
-// Permissions helper
-// ------------------------------
-function canControl(userId, signal) {
-  return userId === config.ownerId || userId === signal.creatorId;
-}
-
-// ------------------------------
-// One-time ghost prune (storage hygiene)
-// ------------------------------
-async function pruneGhostSignals() {
-  try {
-    const all = (await getSignals()).map(normalizeSignal);
-    for (const s of all) {
-      if (!s.messageId || !s.channelId) continue;
-      let exists = true;
-      try {
-        const ch = await client.channels.fetch(s.channelId);
-        await ch.messages.fetch(s.messageId);
-      } catch {
-        exists = false;
-      }
-      if (!exists) {
-        await deleteSignal(s.id).catch(() => {});
-        await deleteControlThread(s.id).catch(() => {});
-        console.log(`🧹 pruned ghost signal ${s.id}`);
-      }
-    }
-  } catch (e) {
-    console.error('pruneGhostSignals error:', e);
-  }
-}
-
-client.login(config.token);
+client.login(cfg.token);
