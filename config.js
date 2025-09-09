@@ -1,30 +1,31 @@
 // config.js
 import 'dotenv/config';
 
-export default {
-  applicationId: process.env.APPLICATION_ID,
-  guildId: process.env.GUILD_ID,
-  token: process.env.DISCORD_TOKEN,
+function req(key) {
+  const v = process.env[key];
+  if (!v) throw new Error(`Missing required env: ${key}`);
+  return v;
+}
+
+const cfg = {
+  token: req('DISCORD_TOKEN'),
+
+  // Application / bot IDs
+  appId: req('APPLICATION_ID'),
+  clientId: req('APPLICATION_ID'),   // <-- add alias so register-commands works
+  guildId: req('GUILD_ID'),
 
   // Channels
-  currentTradesChannelId: process.env.CURRENT_TRADES_CHANNEL_ID,
-  signalsChannelId: process.env.SIGNALS_CHANNEL_ID || null, // optional, you said it's unused
+  signalsChannelId: req('SIGNALS_CHANNEL_ID'),
+  currentTradesChannelId: req('CURRENT_TRADES_CHANNEL_ID'),
 
-  // Storage
-  dbPath: process.env.DB_PATH || './signals.json',
+  // Owner
+  ownerId: req('OWNER_ID'),
 
-  // Mentions / ownership
-  ownerId: process.env.OWNER_ID,
-  traderRoleId: process.env.TRADER_ROLE_ID, // role to @mention when a trade is posted
-
-  // Permissions
-  commandAllowedRoleId: process.env.COMMAND_ALLOWED_ROLE_ID,
-  commandAllowedExtraRoleIds: (process.env.COMMAND_ALLOWED_EXTRA_ROLE_IDS || '')
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean),
-  adminUserIds: (process.env.ADMIN_USER_IDS || '')
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean)
+  // Optional branding
+  brandName: process.env.BRAND_NAME || 'JV Trades',
+  brandAvatarUrl: process.env.BRAND_AVATAR_URL || null,
+  mentionRoleId: process.env.TRADER_ROLE_ID || process.env.MENTION_ROLE_ID || null,
 };
+
+export default cfg;
