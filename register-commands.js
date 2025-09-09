@@ -1,53 +1,88 @@
-// register-commands.js — registers /drako on your Drako application
-import { REST } from '@discordjs/rest';
-import { Routes } from 'discord.js';
-import config from './config.js';
+// register-commands.js
+import 'dotenv/config';
+import { REST, Routes, ApplicationCommandOptionType } from 'discord.js';
 
-const rest = new REST({ version: '10' }).setToken(config.drako.token);
+const TOKEN = process.env.DISCORD_TOKEN;
+const APP_ID = process.env.APPLICATION_ID;
+const GUILD_ID = process.env.GUILD_ID;
 
-// Same options as your /signal
-const drakoCommand = {
-  name: 'drako',
-  description: 'Create a new Drako trade signal',
-  options: [
-    { name: 'asset',     type: 3,  description: 'Asset (BTC, ETH, SOL, or OTHER)', required: true,
-      choices: [
-        { name: 'BTC', value: 'BTC' }, { name: 'ETH', value: 'ETH' },
-        { name: 'SOL', value: 'SOL' }, { name: 'OTHER', value: 'OTHER' },
-      ],
-    },
-    { name: 'direction', type: 3,  description: 'LONG or SHORT', required: true,
-      choices: [{ name: 'LONG', value: 'LONG' }, { name: 'SHORT', value: 'SHORT' }],
-    },
-    { name: 'entry',     type: 3,  description: 'Entry price', required: false },
-    { name: 'sl',        type: 3,  description: 'Stop loss', required: false },
-    { name: 'tp1',       type: 3,  description: 'TP1', required: false },
-    { name: 'tp2',       type: 3,  description: 'TP2', required: false },
-    { name: 'tp3',       type: 3,  description: 'TP3', required: false },
-    { name: 'tp4',       type: 3,  description: 'TP4', required: false },
-    { name: 'tp5',       type: 3,  description: 'TP5', required: false },
+if (!TOKEN || !APP_ID || !GUILD_ID) {
+  console.error('[ENV] DISCORD_TOKEN / APPLICATION_ID / GUILD_ID required');
+  process.exit(1);
+}
 
-    // Optional planned %s:
-    { name: 'tp1_pct',   type: 3,  description: 'TP1 close %', required: false },
-    { name: 'tp2_pct',   type: 3,  description: 'TP2 close %', required: false },
-    { name: 'tp3_pct',   type: 3,  description: 'TP3 close %', required: false },
-    { name: 'tp4_pct',   type: 3,  description: 'TP4 close %', required: false },
-    { name: 'tp5_pct',   type: 3,  description: 'TP5 close %', required: false },
-
-    { name: 'reason',    type: 3,  description: 'Reason (optional)', required: false },
-    { name: 'extra_role',type: 3,  description: 'Extra role mention(s) (IDs or @role)', required: false },
-  ],
-};
+const commands = [
+  {
+    name: 'drako',
+    description: 'Create a trade signal (replica bot version)',
+    dm_permission: false,
+    default_member_permissions: null, // runtime-gated by role in index.js
+    options: [
+      {
+        type: ApplicationCommandOptionType.String,
+        name: 'asset',
+        description: 'Asset symbol (e.g., BTC, ETH, SOL)',
+        required: true
+      },
+      {
+        type: ApplicationCommandOptionType.String,
+        name: 'direction',
+        description: 'Long or Short',
+        required: true,
+        choices: [
+          { name: 'Long', value: 'Long' },
+          { name: 'Short', value: 'Short' }
+        ]
+      },
+      {
+        type: ApplicationCommandOptionType.Number,
+        name: 'entry',
+        description: 'Entry price',
+        required: false
+      },
+      {
+        type: ApplicationCommandOptionType.Number,
+        name: 'sl',
+        description: 'Stop Loss',
+        required: false
+      },
+      {
+        type: ApplicationCommandOptionType.Number,
+        name: 'tp1',
+        description: 'Take Profit 1',
+        required: false
+      },
+      {
+        type: ApplicationCommandOptionType.Number,
+        name: 'tp2',
+        description: 'Take Profit 2',
+        required: false
+      },
+      {
+        type: ApplicationCommandOptionType.Number,
+        name: 'tp3',
+        description: 'Take Profit 3',
+        required: false
+      },
+      {
+        type: ApplicationCommandOptionType.String,
+        name: 'reason',
+        description: 'Optional reasoning (text)',
+        required: false
+      }
+    ]
+  }
+];
 
 async function main() {
+  const rest = new REST({ version: '10' }).setToken(TOKEN);
+
   try {
-    await rest.put(
-      Routes.applicationGuildCommands(config.drako.applicationId, config.drako.guildId),
-      { body: [drakoCommand] }
-    );
-    console.log('✅ Registered /drako for Drako app.');
+    console.log(`[register] Putting ${commands.length} command(s) to guild ${GUILD_ID} ...`);
+    await rest.put(Routes.applicationGuildCommands(APP_ID, GUILD_ID), { body: commands });
+    console.log('[register] Done.');
   } catch (err) {
-    console.error('❌ Failed to register commands:', err);
+    console.error('[register] Failed:', err);
     process.exit(1);
   }
 }
