@@ -1,22 +1,34 @@
-// config.js — Drako bot
+// config.js — Drako bot configuration
+
 function need(key) {
   const v = process.env[key];
-  if (!v || String(v).trim() === '') {
-    throw new Error(`Missing required env: ${key}`);
-  }
-  return v.trim();
+  if (!v) throw new Error(`Missing required env: ${key}`);
+  return v;
 }
 
-// Prefer DRAKO_*; fall back to generic keys if present
-const cfg = {
-  token:               process.env.DRAKO_DISCORD_TOKEN || need('DRAKO_DISCORD_TOKEN'),
-  applicationId:       process.env.DRAKO_APPLICATION_ID || need('DRAKO_APPLICATION_ID'),
-  guildId:             process.env.DRAKO_GUILD_ID       || need('DRAKO_GUILD_ID'),
-  ownerId:             process.env.DRAKO_OWNER_ID        || need('DRAKO_OWNER_ID'),
-  traderRoleId:        process.env.DRAKO_TRADER_ROLE_ID  || need('DRAKO_TRADER_ROLE_ID'),
-  currentTradesChannelId:
-                       process.env.DRAKO_CURRENT_TRADES_CHANNEL_ID || need('DRAKO_CURRENT_TRADES_CHANNEL_ID'),
-  dbPath:              (process.env.DRAKO_DB_PATH || process.env.DB_PATH || './drako-signals.json').trim(),
+const config = {
+  // slash command name for this bot
+  commandName: 'drako',
+
+  // Discord app + token + guild
+  applicationId: need('DRAKO_APPLICATION_ID'),
+  token: need('DRAKO_DISCORD_TOKEN'),
+  guildId: need('DRAKO_GUILD_ID'),
+
+  // IDs
+  ownerId: need('DRAKO_OWNER_ID'),
+
+  // who is allowed to use /drako
+  allowedRoleId: need('DRAKO_ALLOWED_ROLE_ID'),
+
+  // which role to @ by default on every signal (you can still add extra in the command)
+  mentionRoleId: need('DRAKO_MENTION_ROLE_ID'),
+
+  // channel to post the Current Active Trades summary
+  currentTradesChannelId: need('DRAKO_CURRENT_TRADES_CHANNEL_ID'),
+
+  // per-bot JSON DB
+  dbPath: need('DRAKO_DB_PATH'),
 };
 
-export default cfg;
+export default config;
