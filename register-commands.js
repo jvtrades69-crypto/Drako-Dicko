@@ -12,7 +12,7 @@ const pingCmd = new SlashCommandBuilder()
   .setDescription('Simple health check (owner only answers).');
 
 const signalCmd = new SlashCommandBuilder()
-  .setName('signal')
+  .setName('drako')
   .setDescription('Create a new trade signal.')
   .addStringOption(opt =>
     opt.setName('asset').setDescription('Asset').setRequired(true)
