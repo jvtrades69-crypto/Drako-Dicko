@@ -422,7 +422,7 @@ client.on('interactionCreate', async (interaction) => {
     if (!tryClaimInteraction(interaction)) return;
 
     // /signal (unchanged, but stamps timestamps)
-    if (interaction.isChatInputCommand() && interaction.commandName === 'signal') {
+    if (interaction.isChatInputCommand() && interaction.commandName === 'drako') {
       if (interaction.user.id !== config.ownerId) {
         return interaction.reply({ content: 'Only the owner can use this command.', flags: MessageFlags.Ephemeral });
       }
